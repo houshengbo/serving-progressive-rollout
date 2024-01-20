@@ -284,8 +284,25 @@ func getGaugeIndex(targetRevs []v1.TargetRevision) int {
 // defined by the knative service.
 // These values are used to calculate the target number of replicas for the new and
 // the old revision.
-func getGauge(targetRevs []v1.TargetRevision, index int,
-	podAutoscalerLister palisters.PodAutoscalerNamespaceLister) (int32, int64, error) {
+func getGauge(targetRevs []v1.TargetRevision, podAutoscalerLister palisters.PodAutoscalerNamespaceLister) (int32, int64, error) {
+	currentReplicas, currentTraffic, err := getGaugeWithIndex(targetRevs, 0, podAutoscalerLister)
+	if err != nil {
+		return currentReplicas, currentTraffic, err
+	}
+
+	currentReplicasN, currentTrafficN, errN := getGaugeWithIndex(targetRevs, 1, podAutoscalerLister)
+	if errN != nil {
+		return currentReplicasN, currentTrafficN, errN
+	}
+
+	// Between two revisions, we need the larger number of the replicas as the gauge.
+	if int64(currentReplicas)*currentTrafficN > int64(currentReplicasN)*currentTraffic {
+		return currentReplicas, currentTraffic, nil
+	}
+	return currentReplicasN, currentTrafficN, nil
+}
+
+func getGaugeWithIndex(targetRevs []v1.TargetRevision, index int, podAutoscalerLister palisters.PodAutoscalerNamespaceLister) (int32, int64, error) {
 	revisionStatus := targetRevs[index]
 	currentTraffic := *revisionStatus.Percent
 
@@ -324,7 +341,7 @@ func updateStageTargetRevisions(ro *v1.RolloutOrchestrator, config *RolloutConfi
 
 	// The currentReplicas and currentTraffic will be used as the standard values to calculate
 	// the further target number of replicas for each revision.
-	currentReplicas, currentTraffic, err := getGauge(startRevisions, index, podAutoscalerLister)
+	currentReplicas, currentTraffic, err := getGauge(startRevisions, podAutoscalerLister)
 	if err != nil {
 		return ro, err
 	}
@@ -398,7 +415,7 @@ func shiftTrafficNextStage(revisionTarget []v1.TargetRevision,
 	// The TargetRevision at the index 0 will always be the revision that is about to scale down.
 	// We get the number of replicas and how much traffic dispatched to this revision, and use them as the gauge
 	// to calculate the number of replicas for any other traffic percentage.
-	currentReplicas, currentTraffic, err := getGauge(revisionTarget, 0, podAutoscalerLister)
+	currentReplicas, currentTraffic, err := getGauge(revisionTarget, podAutoscalerLister)
 	if err != nil {
 		return revisionTarget, err
 	}
@@ -448,13 +465,13 @@ func getActualReplicas(pa *v1alpha1.PodAutoscaler) int32 {
 	return revReplicas
 }
 
-func calculateStageTargetRevisions(initialTargetRev, finalTargetRevs []v1.TargetRevision,
+func calculateStageTargetRevisions(startRev, finalTargetRevs []v1.TargetRevision,
 	stageReplicasInt int32, stageTrafficDeltaInt int64, currentReplicas int32, currentTraffic int64,
 	podAutoscalerLister palisters.PodAutoscalerNamespaceLister) ([]v1.TargetRevision, error) {
 	stageRevisionTarget := make([]v1.TargetRevision, 0)
 	var tempTarget v1.TargetRevision
-	if len(initialTargetRev) == 2 {
-		tempTarget = initialTargetRev[1]
+	if len(startRev) == 2 {
+		tempTarget = startRev[1]
 	} else {
 		tempTarget = getInitialStageRevisionTarget(finalTargetRevs[0])
 	}
@@ -464,20 +481,24 @@ func calculateStageTargetRevisions(initialTargetRev, finalTargetRevs []v1.Target
 		return stageRevisionTarget, nil
 	}
 	stageRevisionTarget = make([]v1.TargetRevision, 2)
-	if len(initialTargetRev) == 2 {
-		target := initialTargetRev[0].DeepCopy()
+	if len(startRev) == 2 {
+		target := startRev[0].DeepCopy()
 		pa, err := podAutoscalerLister.Get(target.RevisionName)
 		if err != nil {
 			return stageRevisionTarget, err
 		}
 
 		oldRevReplicas := getActualReplicas(pa)
-
-		target.TargetReplicas = ptr.Int32(oldRevReplicas - stageReplicasInt)
 		target.Percent = ptr.Int64(*target.Percent - stageTrafficDeltaInt)
+		target.TargetReplicas = ptr.Int32(oldRevReplicas - stageReplicasInt)
+
+		replicas := float64(currentReplicas) * float64(*target.Percent) / float64(currentTraffic)
+		if *target.TargetReplicas < 0 || float64(*target.TargetReplicas) < replicas {
+			target.TargetReplicas = ptr.Int32(int32(math.Ceil(replicas)))
+		}
 		stageRevisionTarget[0] = *target
 
-		targetN := initialTargetRev[1].DeepCopy()
+		targetN := startRev[1].DeepCopy()
 		pa, err = podAutoscalerLister.Get(targetN.RevisionName)
 		if err != nil {
 			return stageRevisionTarget, err
@@ -485,10 +506,20 @@ func calculateStageTargetRevisions(initialTargetRev, finalTargetRevs []v1.Target
 		currentReplicas = getActualReplicas(pa)
 		targetN.TargetReplicas = ptr.Int32(currentReplicas + stageReplicasInt)
 		targetN.Percent = ptr.Int64(currentTraffic + stageTrafficDeltaInt)
+
+		replicas = float64(currentReplicas) * float64(*targetN.Percent) / float64(currentTraffic)
+		if float64(*targetN.TargetReplicas) > replicas {
+			targetN.TargetReplicas = ptr.Int32(int32(math.Ceil(replicas)))
+		}
 		stageRevisionTarget[1] = *targetN
 	} else {
 		// Update the old revision record in the stageRevisionTarget.
-		target := initialTargetRev[0].DeepCopy()
+		target := startRev[0].DeepCopy()
+		pa, err := podAutoscalerLister.Get(target.RevisionName)
+		if err != nil {
+			return stageRevisionTarget, err
+		}
+		currentReplicas = getActualReplicas(pa)
 		target.LatestRevision = ptr.Bool(false)
 		target.Direction = "down"
 		target.TargetReplicas = ptr.Int32(currentReplicas - stageReplicasInt)
